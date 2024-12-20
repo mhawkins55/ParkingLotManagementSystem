@@ -1,9 +1,11 @@
-
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.text.ParseException;
+import java.text.SimpleDateFormat;
+import java.util.Date;
 import java.util.Scanner;
 
 public class Main {
@@ -133,7 +135,7 @@ public class Main {
 
             if (rs.next() && "user".equalsIgnoreCase(rs.getString("user_type"))) {
                 System.out.println("Logged in as user.");
-                userMenu(conn, scanner); // Redirect to user menu after login
+                userMenu(conn, scanner, email); // Pass email to user menu
             } else {
                 System.out.println("Invalid email or password.");
             }
@@ -142,14 +144,15 @@ public class Main {
         }
     }
 
-    private static void userMenu(Connection conn, Scanner scanner) throws SQLException {
+    private static void userMenu(Connection conn, Scanner scanner, String email) throws SQLException {
         boolean inUserMenu = true;
 
         while (inUserMenu) {
             System.out.println("User Menu:");
             System.out.println("1. View available parking spots");
             System.out.println("2. Make a reservation");
-            System.out.println("3. Back");
+            System.out.println("3. Finish reservation and pay");
+            System.out.println("4. Back");
             int userChoice = scanner.nextInt();
 
             switch (userChoice) {
@@ -157,10 +160,13 @@ public class Main {
                     viewAvailableSpots(conn);
                     break;
                 case 2:
-                    makeReservation(conn, scanner);
+                    makeReservation(conn, scanner, email);
                     break;
                 case 3:
-                    inUserMenu = false; // Go back to main menu
+                    finishReservation(conn, scanner, email);
+                    break;
+                case 4:
+                    inUserMenu = false;
                     System.out.println("Returning to main menu.");
                     break;
                 default:
@@ -184,37 +190,131 @@ public class Main {
         }
     }
 
-    private static void makeReservation(Connection conn, Scanner scanner) {
-        System.out.println("Available parking spots:");
-        String availableSpotsQuery = "SELECT spot_id, spot_number FROM ParkingSpots WHERE is_reserved = 0";
-        try (PreparedStatement stmt = conn.prepareStatement(availableSpotsQuery);
-             ResultSet rs = stmt.executeQuery()) {
-
-            while (rs.next()) {
-                int spotId = rs.getInt("spot_id");
-                int spotNumber = rs.getInt("spot_number");
-                System.out.println("Spot ID: " + spotId + ", Spot Number: " + spotNumber);
-            }
-
-        } catch (SQLException e) {
-            System.out.println("Error retrieving available spots: " + e.getMessage());
-            return;
-        }
+    private static void makeReservation(Connection conn, Scanner scanner, String email) {
+        viewAvailableSpots(conn);
 
         System.out.print("Enter the Spot ID to reserve: ");
         int spotId = scanner.nextInt();
 
-        String query = "UPDATE ParkingSpots SET is_reserved = 1 WHERE spot_id = ? AND is_reserved = 0";
-        try (PreparedStatement stmt = conn.prepareStatement(query)) {
-            stmt.setInt(1, spotId);
-            int rowsUpdated = stmt.executeUpdate();
-            if (rowsUpdated > 0) {
-                System.out.println("Reservation successful for Spot ID: " + spotId);
-            } else {
-                System.out.println("Error: Spot ID not found or already reserved.");
-            }
+        // Automatically fetch current date
+        String currentDate = new SimpleDateFormat("yyyy-MM-dd").format(new Date());
+
+        // Prompt user for time only
+        System.out.print("Enter your parking start time (hh:mm): ");
+        String time = scanner.next();
+        System.out.print("Is it AM or PM? (Enter AM/PM): ");
+        String amPm = scanner.next().toUpperCase();
+
+        // Combine date and time
+        String startTimeInput = currentDate + " " + time + " " + amPm;
+
+        // Convert to 24-hour format for the database
+        SimpleDateFormat inputFormat = new SimpleDateFormat("yyyy-MM-dd hh:mm a");
+        SimpleDateFormat outputFormat = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
+        String startTime;
+        try {
+            Date parsedDate = inputFormat.parse(startTimeInput);
+            startTime = outputFormat.format(parsedDate);
+        } catch (ParseException e) {
+            System.out.println("Invalid time format. Please try again.");
+            return;
+        }
+
+        String reservationQuery = "INSERT INTO Reservations (user_id, spot_id, start_time, is_reserved) VALUES ((SELECT user_id FROM Users WHERE email = ?), ?, ?, TRUE)";
+        String updateSpotQuery = "UPDATE ParkingSpots SET is_reserved = 1 WHERE spot_id = ?";
+        try (PreparedStatement reservationStmt = conn.prepareStatement(reservationQuery);
+             PreparedStatement updateSpotStmt = conn.prepareStatement(updateSpotQuery)) {
+
+            reservationStmt.setString(1, email);
+            reservationStmt.setInt(2, spotId);
+            reservationStmt.setString(3, startTime);
+            reservationStmt.executeUpdate();
+
+            updateSpotStmt.setInt(1, spotId);
+            updateSpotStmt.executeUpdate();
+
+            System.out.println("Reservation successful for Spot ID: " + spotId);
         } catch (SQLException e) {
             System.out.println("Error making reservation: " + e.getMessage());
+        }
+    }
+
+    private static void finishReservation(Connection conn, Scanner scanner, String email) {
+        String getReservationsQuery = "SELECT reservation_id, spot_id, start_time FROM Reservations WHERE user_id = (SELECT user_id FROM Users WHERE email = ?) AND is_reserved = TRUE";
+        try (PreparedStatement getReservationsStmt = conn.prepareStatement(getReservationsQuery)) {
+            getReservationsStmt.setString(1, email);
+            ResultSet rs = getReservationsStmt.executeQuery();
+
+            System.out.println("Your active reservations:");
+            boolean hasReservations = false;
+            while (rs.next()) {
+                hasReservations = true;
+                int reservationId = rs.getInt("reservation_id");
+                int spotId = rs.getInt("spot_id");
+                String startTime = rs.getString("start_time");
+                System.out.printf("Reservation ID: %d | Spot ID: %d | Start Time: %s\n", reservationId, spotId, startTime);
+            }
+
+            if (!hasReservations) {
+                System.out.println("No active reservations found.");
+                return;
+            }
+
+            System.out.print("Enter the Reservation ID to finish: ");
+            int reservationId = scanner.nextInt();
+
+            processReservation(conn, scanner, email, reservationId);
+        } catch (SQLException e) {
+            System.out.println("Error fetching reservations: " + e.getMessage());
+        }
+    }
+
+    private static void processReservation(Connection conn, Scanner scanner, String email, int reservationId) {
+        String getDetailsQuery = "SELECT start_time, spot_id FROM Reservations WHERE reservation_id = ? AND user_id = (SELECT user_id FROM Users WHERE email = ?)";
+        String updateReservationQuery = "UPDATE Reservations SET is_reserved = FALSE, payment_status = 'Paid' WHERE reservation_id = ?";
+        String releaseSpotQuery = "UPDATE ParkingSpots SET is_reserved = 0 WHERE spot_id = ?";
+        try (PreparedStatement getDetailsStmt = conn.prepareStatement(getDetailsQuery);
+             PreparedStatement updateReservationStmt = conn.prepareStatement(updateReservationQuery);
+             PreparedStatement releaseSpotStmt = conn.prepareStatement(releaseSpotQuery)) {
+
+            getDetailsStmt.setInt(1, reservationId);
+            getDetailsStmt.setString(2, email);
+            ResultSet rs = getDetailsStmt.executeQuery();
+
+            if (rs.next()) {
+                String startTime = rs.getString("start_time");
+                int spotId = rs.getInt("spot_id");
+
+                String calculateDurationQuery = "SELECT TIMESTAMPDIFF(HOUR, ?, NOW()) AS duration";
+                try (PreparedStatement durationStmt = conn.prepareStatement(calculateDurationQuery)) {
+                    durationStmt.setString(1, startTime);
+                    ResultSet durationRs = durationStmt.executeQuery();
+                    if (durationRs.next()) {
+                        int duration = durationRs.getInt("duration");
+                        double totalAmount = duration * 2.0;
+
+                        System.out.printf("You parked for %d hours. Total amount: $%.2f\n", duration, totalAmount);
+
+                        System.out.print("Confirm payment (Y/N): ");
+                        String confirmation = scanner.next();
+                        if (confirmation.equalsIgnoreCase("Y")) {
+                            updateReservationStmt.setInt(1, reservationId);
+                            updateReservationStmt.executeUpdate();
+
+                            releaseSpotStmt.setInt(1, spotId);
+                            releaseSpotStmt.executeUpdate();
+
+                            System.out.println("Payment successful. Spot is now available.");
+                        } else {
+                            System.out.println("Payment canceled.");
+                        }
+                    }
+                }
+            } else {
+                System.out.println("Reservation not found.");
+            }
+        } catch (SQLException e) {
+            System.out.println("Error completing reservation: " + e.getMessage());
         }
     }
 
@@ -256,7 +356,6 @@ public class Main {
     }
 
     private static void addParkingSpot(Scanner scanner) {
-        // Display current spots before adding a new one
         System.out.println("Current parking spots:");
         displayAllParkingSpots();
 
@@ -279,7 +378,6 @@ public class Main {
     }
 
     private static void removeParkingSpot(Scanner scanner) {
-        // Display current spots before removing one
         System.out.println("Current parking spots:");
         displayAllParkingSpots();
 
@@ -320,3 +418,6 @@ public class Main {
         }
     }
 }
+
+
+
